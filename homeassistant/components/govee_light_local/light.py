@@ -119,6 +119,12 @@ class GoveeLight(CoordinatorEntity[GoveeLocalApiCoordinator], LightEntity):
             serial_number=device.fingerprint,
         )
 
+        # Cache for last known color/brightness to preserve across off state
+        self._cached_rgb_color: tuple[int, int, int] | None = None
+        self._cached_color_temp: int | None = None
+        self._cached_brightness: int | None = None
+
+    # -- Attribute accessors with caching ---------------------------------
     @property
     def is_on(self) -> bool:
         """Return true if device is on (brightness above 0)."""
@@ -127,17 +133,26 @@ class GoveeLight(CoordinatorEntity[GoveeLocalApiCoordinator], LightEntity):
     @property
     def brightness(self) -> int:
         """Return the brightness of this light between 0..255."""
-        return int((self._device.brightness / 100.0) * 255.0)
-
+        # Cache brightness even if device reports 0 (off)
+        current = int((self._device.brightness / 100.0) * 255.0)
+        if current > 0:
+            self._cached_brightness = current
+        return self._cached_brightness or current
     @property
     def color_temp_kelvin(self) -> int | None:
         """Return the color temperature in Kelvin."""
-        return self._device.temperature_color
+        val = self._device.temperature_color
+        if val:
+            self._cached_color_temp = val
+        return self._cached_color_temp or val
 
     @property
     def rgb_color(self) -> tuple[int, int, int] | None:
         """Return the rgb color."""
-        return self._device.rgb_color
+        val = self._device.rgb_color
+        if val:
+            self._cached_rgb_color = val
+        return self._cached_rgb_color or val
 
     @property
     def color_mode(self) -> ColorMode | str | None:
@@ -187,6 +202,16 @@ class GoveeLight(CoordinatorEntity[GoveeLocalApiCoordinator], LightEntity):
         if not self.is_on or not kwargs:
             await self.coordinator.turn_on(self._device)
 
+        # If turning on without color args, restore cached color/brightness
+        if not any(k in kwargs for k in (ATTR_RGB_COLOR, ATTR_COLOR_TEMP_KELVIN, ATTR_EFFECT)):
+            if self._cached_rgb_color:
+                await self.coordinator.set_rgb_color(self._device, *self._cached_rgb_color)
+            elif self._cached_color_temp:
+                await self.coordinator.set_temperature(self._device, int(self._cached_color_temp))
+            if self._cached_brightness:
+                brightness_pct = int((float(self._cached_brightness) / 255.0) * 100.0)
+                await self.coordinator.set_brightness(self._device, brightness_pct)
+
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
@@ -194,9 +219,28 @@ class GoveeLight(CoordinatorEntity[GoveeLocalApiCoordinator], LightEntity):
         await self.coordinator.turn_off(self._device)
         self.async_write_ha_state()
 
+        # Preserve last known color/brightness on power off
+        if self._device.rgb_color:
+            self._cached_rgb_color = self._device.rgb_color
+        if self._device.temperature_color:
+            self._cached_color_temp = self._device.temperature_color
+        if self._device.brightness:
+            self._cached_brightness = int((self._device.brightness / 100.0) * 255.0)
+
+        # Do NOT clear color/brightness cache when off; they’re needed for snapshot restore
+
     @callback
     def _update_callback(self, device: GoveeDevice) -> None:
         self.async_write_ha_state()
+
+
+        # Refresh cache when new state updates arrive
+        if device.rgb_color:
+            self._cached_rgb_color = device.rgb_color
+        if device.temperature_color:
+            self._cached_color_temp = device.temperature_color
+        if device.brightness:
+            self._cached_brightness = int((device.brightness / 100.0) * 255.0)
 
     def _save_last_color_state(self) -> None:
         color_mode = self.color_mode
